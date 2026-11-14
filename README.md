@@ -17,14 +17,15 @@ gcloud auth application-default login \
 git clone https://github.com/mizorewww/colab-qwen38-g4.git
 cd colab-qwen38-g4
 
-# 交互式启动（按提示回车即可，支持可选挂载 Google Drive 与自动写入 pi 配置）：
+# 交互式启动（按提示回车即可；支持 Cloudflare Tunnel 或 Colab SSH 本地端口转发，
+# 自动写入 pi 配置，并在后台启动保活与故障自愈守护进程防止 20 分钟断连回收）：
 python3 run_qwen38_g4.py
 ```
 
-或者不走交互式向导，直接单条命令全自动跑起来：
+或者不走交互式向导，直接单条命令跑起来（脚本会在部署完成后保持 Kernel 忙碌保活至多 12 小时）：
 
 ```bash
-colab run --gpu G4 --keep -s qwen38-g4 --timeout 1800 run_qwen38_g4.py
+colab run --gpu G4 --keep -s qwen38-g4 --timeout 43200 run_qwen38_g4.py
 ```
 
 跑完后终端会直接输出反代地址与 Key：
@@ -91,8 +92,13 @@ pi --model "colab-g4/dealignai/Qwen3.8-Flash-Next-CYBERSECURITY-NVFP4" -p "看�
 }
 ```
 
-## 4. 用完关闭实例（停止计费）
+## 4. 查看状态与用完关闭实例（停止计费）
 
 ```bash
-colab stop -s qwen38-g4
+# 查看实例与本地保活守护进程状态
+python3 run_qwen38_g4.py --status -s qwen38-g4
+
+# 停止本地保活守护进程并销毁远端 Colab G4 实例
+python3 run_qwen38_g4.py --stop -s qwen38-g4
+# （直接执行 `colab stop -s qwen38-g4` 也可以，后台保活进程检测到实例销毁后会自动退出）
 ```

@@ -1,4 +1,4 @@
-#!/usr/bin/env -S colab run --gpu G4 --keep -s qwen38-g4 --timeout 1800
+#!/usr/bin/env -S colab run --gpu G4 --keep -s qwen38-g4 --timeout 43200
 """
 One-click & Interactive Deployment Script for Qwen3.8-Flash-Next-CYBERSECURITY-NVFP4
 on Google Colab G4 GPU (NVIDIA RTX PRO 6000 Blackwell 96GB) with 262K Context & MTP (NEXTN).
@@ -6,23 +6,31 @@ on Google Colab G4 GPU (NVIDIA RTX PRO 6000 Blackwell 96GB) with 262K Context & 
 Repository: https://github.com/mizorewww/colab-qwen38-g4
 
 Two ways to run:
-  Mode A — Interactive Local Wizard (recommended for first-time users & Google Drive setup):
+  Mode A — Interactive Local Wizard (spawns background keep-alive & auto-heal daemon):
     python3 run_qwen38_g4.py
 
-  Mode B — Direct One-Command Remote Execution via colab CLI:
-    colab run --gpu G4 --keep -s qwen38-g4 --timeout 1800 run_qwen38_g4.py
-    # or re-run on an existing session:
-    colab exec -s qwen38-g4 --timeout 1800 -f run_qwen38_g4.py
+  Mode B — Direct One-Command Remote Execution via colab CLI (holds kernel active up to 12h):
+    colab run --gpu G4 --keep -s qwen38-g4 --timeout 43200 run_qwen38_g4.py
+
+  Helper commands (local):
+    python3 run_qwen38_g4.py --keepalive [-s qwen38-g4]   # Start/reattach background keep-alive
+    python3 run_qwen38_g4.py --status    [-s qwen38-g4]   # Check session & keep-alive daemon status
+    python3 run_qwen38_g4.py --stop      [-s qwen38-g4]   # Stop daemon & release Colab VM
 """
 
+import argparse
 import glob
 import json
 import os
 import re
 import secrets
+import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -39,8 +47,15 @@ GITHUB_RELEASE_BASE = os.environ.get(
 )
 API_KEY = os.environ.get("COLAB_SGLANG_API_KEY", "sk-qwen38-g4-cyber-9f8a7b6c5d4e3f2a")
 ENABLE_MTP = os.environ.get("ENABLE_MTP", "1") not in ("0", "false", "False", "no")
+ENABLE_TUNNEL = os.environ.get("ENABLE_TUNNEL", "1") not in ("0", "false", "False", "no")
 WEIGHT_SOURCE = os.environ.get("WEIGHT_SOURCE", "auto")  # auto | hf | drive
 BACKUP_TO_DRIVE = os.environ.get("BACKUP_TO_DRIVE", "0") in ("1", "true", "True", "yes")
+
+# Pop transient per-invocation flags so they never leak across persistent Jupyter kernel cells
+WATCHDOG_ONLY = os.environ.pop("WATCHDOG_ONLY", "0") in ("1", "true", "True", "yes")
+KEEPALIVE_SECONDS = int(os.environ.pop("COLAB_KEEPALIVE_SECONDS", "43200"))
+
+CF_URL_REGEX = re.compile(r"https://(?!api\.)[a-zA-Z0-9-]+\.trycloudflare\.com")
 
 
 def log(msg: str):
@@ -71,6 +86,18 @@ def run_cmd(cmd: str, log_path: str = "/content/cmd.log", check: bool = True) ->
         tail = subprocess.getoutput(f"tail -n 30 {log_path}")
         raise RuntimeError(f"Command failed (rc={p.returncode}): {cmd}\n{tail}")
     return p.returncode
+
+
+def check_sglang_healthy(api_key: str = API_KEY, port: int = 30000) -> bool:
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
 
 def step1_install_and_restore_cache() -> float:
@@ -243,26 +270,49 @@ def step2_prepare_weights() -> float:
 
     prepare_mtp_draft_dir()
 
-    if BACKUP_TO_DRIVE and os.path.isdir("/content/drive/MyDrive") and len(drive_shards) < 206:
-        log(f"Starting background backup of weights to Google Drive ({DRIVE_MODEL_DIR})...")
-        os.makedirs(DRIVE_MODEL_DIR, exist_ok=True)
-        subprocess.Popen(
-            ["nohup", "cp", "-rn", f"{LOCAL_MODEL_DIR}/.", f"{DRIVE_MODEL_DIR}/"],
-            stdout=open("/content/drive_backup.log", "w"),
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            close_fds=True,
-            start_new_session=True,
-        )
-
     dt = time.time() - t0
     log(f"Step 2/4 complete: 206 shards + 3-shard MTP draft dir ready on local NVMe in {dt:.1f}s!")
     return dt
 
 
-def step3_start_tunnel() -> str:
+def maybe_start_drive_backup_in_background():
+    """Start Google Drive backup AFTER SGLang finishes loading weights so Drive FUSE
+    writeback never competes with SGLang for NVMe I/O or host RAM page cache.
+    """
+    if not BACKUP_TO_DRIVE or not os.path.isdir("/content/drive/MyDrive"):
+        return
+    drive_shards = glob.glob(os.path.join(DRIVE_MODEL_DIR, "*.safetensors")) if os.path.isdir(DRIVE_MODEL_DIR) else []
+    if len(drive_shards) >= 206:
+        return
+    if subprocess.getoutput("pgrep -f 'cp -rn /content/Qwen3.8'").strip():
+        return
+
+    log(f"Starting low-priority background backup of weights to Google Drive ({DRIVE_MODEL_DIR})...")
+    os.makedirs(DRIVE_MODEL_DIR, exist_ok=True)
+    subprocess.Popen(
+        [
+            "nohup", "ionice", "-c", "3", "nice", "-n", "19",
+            "cp", "-rn", f"{LOCAL_MODEL_DIR}/.", f"{DRIVE_MODEL_DIR}/",
+        ],
+        stdout=open("/content/drive_backup.log", "w"),
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+
+
+def step3_start_tunnel(force_restart: bool = False) -> str:
+    if not ENABLE_TUNNEL:
+        log("Step 3/4: Skipping Cloudflare Tunnel (using Colab SSH port-forwarding).")
+        return "http://127.0.0.1:30000"
+
     log("Step 3/4: Starting Cloudflare Quick Tunnel (trycloudflare.com)...")
-    if not subprocess.getoutput("pgrep -f '[c]loudflared'"):
+    if force_restart:
+        subprocess.run("pkill -9 -f '[c]loudflared' || true", shell=True)
+        time.sleep(1)
+
+    if not subprocess.getoutput("pgrep -f '[c]loudflared'").strip():
         cf_sh = """#!/bin/bash
 export PATH="/tools/node/bin:/usr/local/bin:$PATH"
 exec cloudflared --no-autoupdate tunnel --url http://localhost:30000
@@ -281,7 +331,7 @@ exec cloudflared --no-autoupdate tunnel --url http://localhost:30000
     tunnel_url = None
     for _ in range(30):
         log_txt = subprocess.getoutput("cat /content/cf_tunnel.log 2>/dev/null")
-        m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", log_txt)
+        m = CF_URL_REGEX.search(log_txt)
         if m:
             tunnel_url = m.group(0)
             break
@@ -291,12 +341,7 @@ exec cloudflared --no-autoupdate tunnel --url http://localhost:30000
     return tunnel_url
 
 
-def step4_start_sglang_and_wait() -> float:
-    mode_label = "MTP Speculative Decoding (NEXTN)" if ENABLE_MTP else "Standard High-Capacity (No-MTP)"
-    log(f"Step 4/4: Launching SGLang Server [{mode_label} + 262K Context]...")
-    subprocess.run("pkill -9 -f '[s]glang' || true", shell=True)
-
-    spec_flags = ""
+def build_sglang_script() -> str:
     if ENABLE_MTP:
         spec_flags = f"""  --speculative-draft-model-path {LOCAL_MTP_DRAFT_DIR} \\
   --speculative-algorithm NEXTN \\
@@ -315,7 +360,7 @@ def step4_start_sglang_and_wait() -> float:
   --chunked-prefill-size 8192 \\
   --mem-fraction-static 0.93 \\"""
 
-    sglang_sh = f"""#!/bin/bash
+    return f"""#!/bin/bash
 set -ex
 export PATH="/tools/node/bin:/usr/local/bin:$PATH"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -346,6 +391,24 @@ exec sglang serve \\
   --host 0.0.0.0 \\
   --port 30000
 """
+
+
+def step4_start_sglang_and_wait(force_restart: bool = False) -> float:
+    mode_label = "MTP Speculative Decoding (NEXTN)" if ENABLE_MTP else "Standard High-Capacity (No-MTP)"
+    sglang_sh = build_sglang_script()
+
+    existing_sh = ""
+    if os.path.exists("/content/start_sglang.sh"):
+        with open("/content/start_sglang.sh") as f:
+            existing_sh = f.read()
+
+    if not force_restart and existing_sh == sglang_sh and check_sglang_healthy():
+        log(f"Step 4/4: SGLang Server [{mode_label}] is already running and healthy!")
+        return 0.1
+
+    log(f"Step 4/4: Launching SGLang Server [{mode_label} + 262K Context]...")
+    subprocess.run("pkill -9 -f '[s]glang' || true", shell=True)
+
     with open("/content/start_sglang.sh", "w") as f:
         f.write(sglang_sh)
     subprocess.Popen(
@@ -359,22 +422,13 @@ exec sglang serve \\
 
     t0 = time.time()
     last_line = ""
-    while time.time() - t0 < 1200:
+    while time.time() - t0 < 2400:
         sgl_txt = subprocess.getoutput("cat /content/sglang.log 2>/dev/null | tr '\r' '\n'")
         lines = sgl_txt.splitlines()
-        if "The server is fired up and ready to roll!" in sgl_txt:
-            try:
-                req = urllib.request.Request(
-                    "http://127.0.0.1:30000/v1/models",
-                    headers={"Authorization": f"Bearer {API_KEY}"},
-                )
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    if resp.status == 200:
-                        dt = time.time() - t0
-                        log(f"Step 4/4 complete: SGLang server is READY in {dt:.1f}s!")
-                        return dt
-            except Exception:
-                pass
+        if "The server is fired up and ready to roll!" in sgl_txt and check_sglang_healthy():
+            dt = time.time() - t0
+            log(f"Step 4/4 complete: SGLang server is READY in {dt:.1f}s!")
+            return dt
 
         if lines and lines[-1] != last_line:
             last_line = lines[-1]
@@ -386,12 +440,72 @@ exec sglang serve \\
     raise TimeoutError("Timed out waiting for SGLang server to become ready.")
 
 
+def run_remote_watchdog_loop(duration_sec: int):
+    """Hold the Jupyter kernel BUSY with periodic iopub heartbeats so Google Colab
+    does not reap the VM after ~20m of kernel/WebSocket inactivity, while also
+    auto-healing SGLang and Cloudflare Tunnel if either process crashes.
+    """
+    if duration_sec <= 0:
+        return
+
+    t_start = time.time()
+    last_heartbeat = 0.0
+    sglang_failures = 0
+
+    while time.time() - t_start < duration_sec:
+        # 1. Monitor SGLang health
+        if check_sglang_healthy():
+            sglang_failures = 0
+        else:
+            sglang_failures += 1
+            proc_alive = bool(subprocess.getoutput("pgrep -f '[s]glang'").strip())
+            if not proc_alive or sglang_failures >= 3:
+                log("[watchdog] SGLang process exited or failed health checks; restarting...")
+                step4_start_sglang_and_wait(force_restart=True)
+                sglang_failures = 0
+
+        # 2. Monitor Cloudflare Tunnel health (if enabled)
+        tunnel_status = "SSH"
+        if ENABLE_TUNNEL:
+            cf_alive = bool(subprocess.getoutput("pgrep -f '[c]loudflared'").strip())
+            if not cf_alive:
+                log("[watchdog] cloudflared exited; restarting Quick Tunnel...")
+                new_url = step3_start_tunnel(force_restart=True)
+                if new_url:
+                    print(f"TUNNEL_BASE_URL={new_url}/v1", flush=True)
+            log_txt = subprocess.getoutput("cat /content/cf_tunnel.log 2>/dev/null")
+            m = CF_URL_REGEX.search(log_txt)
+            tunnel_status = m.group(0) if m else "reconnecting"
+
+        # 3. Emit periodic iopub stream output to keep Colab kernel & proxy WebSocket active
+        now = time.time()
+        if now - last_heartbeat >= 60:
+            gpu_info = subprocess.getoutput(
+                "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
+                "--format=csv,noheader,nounits 2>/dev/null"
+            ).strip()
+            gpu_summary = f" | GPU: {gpu_info}" if gpu_info else ""
+            sglang_status = "OK" if sglang_failures == 0 else f"UNHEALTHY({sglang_failures})"
+            log(f"[keepalive] SGLang={sglang_status} | Tunnel={tunnel_status}{gpu_summary}")
+            last_heartbeat = now
+
+        remaining = duration_sec - (time.time() - t_start)
+        if remaining <= 0:
+            break
+        time.sleep(min(20.0, remaining))
+
+
 def run_remote_vm_main():
+    if WATCHDOG_ONLY:
+        run_remote_watchdog_loop(KEEPALIVE_SECONDS)
+        return
+
     t_start = time.time()
     dt_env = step1_install_and_restore_cache()
     dt_weights = step2_prepare_weights()
     tunnel_url = step3_start_tunnel()
     dt_sglang = step4_start_sglang_and_wait()
+    maybe_start_drive_backup_in_background()
     total_dt = time.time() - t_start
     print("\n" + "=" * 72)
     print(f"DEPLOYMENT SUCCESSFUL (total: {total_dt:.1f}s | env: {dt_env:.1f}s | weights: {dt_weights:.1f}s | sglang+warmup: {dt_sglang:.1f}s)")
@@ -400,9 +514,310 @@ def run_remote_vm_main():
     print(f"MODEL_ID={MODEL_ID}")
     print("=" * 72, flush=True)
 
+    if KEEPALIVE_SECONDS > 0:
+        log(
+            f"Keep-alive watchdog active for {KEEPALIVE_SECONDS // 3600}h "
+            f"(holding Jupyter kernel busy so Colab does not auto-stop the VM)."
+        )
+        log("Keep this process running, or press Ctrl+C to detach (use 'colab stop' when done).")
+        try:
+            run_remote_watchdog_loop(KEEPALIVE_SECONDS)
+        except KeyboardInterrupt:
+            log("Detached from keep-alive watchdog (VM is still running; stop via 'colab stop').")
+
 
 # ============================================================================
-# Local Interactive Wizard Mode (when invoked via `python3 run_qwen38_g4.py`)
+# Local Keep-Alive & SSH Tunnel Daemon (prevents ~20m Colab idle disconnect)
+# ============================================================================
+
+CACHE_DIR = Path.home() / ".cache" / "colab-qwen38-g4"
+
+
+def get_daemon_paths(session_name: str) -> tuple[Path, Path]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", session_name)
+    return (
+        CACHE_DIR / f"keepalive-{safe_name}.pid",
+        CACHE_DIR / f"keepalive-{safe_name}.log",
+    )
+
+
+def is_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def stop_local_keepalive_daemon(session_name: str, quiet: bool = False) -> bool:
+    pid_path, _ = get_daemon_paths(session_name)
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text().strip())
+    except Exception:
+        pid_path.unlink(missing_ok=True)
+        return False
+
+    stopped = False
+    if is_pid_alive(pid):
+        cmdline = subprocess.getoutput(f"ps -p {pid} -o command=").strip()
+        if "run_qwen38_g4.py" in cmdline or "keepalive-daemon" in cmdline or "python" in cmdline.lower():
+            try:
+                os.kill(pid, signal.SIGTERM)
+                for _ in range(25):
+                    if not is_pid_alive(pid):
+                        break
+                    time.sleep(0.1)
+                if is_pid_alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+                stopped = True
+                if not quiet:
+                    print(f"✓ Stopped previous keep-alive daemon for '{session_name}' (PID {pid})")
+            except OSError:
+                pass
+    pid_path.unlink(missing_ok=True)
+    return stopped
+
+
+def check_colab_session_state(session_name: str) -> str:
+    """Return 'active', 'absent', or 'unknown' (e.g. transient local network error)."""
+    try:
+        res = subprocess.run(
+            ["colab", "sessions"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if res.returncode != 0:
+            return "unknown"
+        out = (res.stdout or "") + "\n" + (res.stderr or "")
+        return "active" if f"[{session_name}]" in out else "absent"
+    except Exception:
+        return "unknown"
+
+
+def ensure_colab_ssh_identity() -> Path:
+    """Find an Ed25519/ECDSA SSH key accepted by Colab SSH, or create a dedicated Ed25519 key."""
+    ssh_dir = Path.home() / ".ssh"
+    for key_name in ("id_ed25519", "id_ecdsa"):
+        priv = ssh_dir / key_name
+        pub = ssh_dir / f"{key_name}.pub"
+        if priv.exists() and pub.exists():
+            return priv
+
+    colab_key_dir = Path.home() / ".config" / "colab-cli"
+    colab_key_dir.mkdir(parents=True, exist_ok=True)
+    priv = colab_key_dir / "id_ed25519"
+    pub = colab_key_dir / "id_ed25519.pub"
+    if not (priv.exists() and pub.exists()):
+        subprocess.run(
+            ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv), "-q"],
+            check=True,
+        )
+    return priv
+
+
+def is_local_port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def run_local_keepalive_daemon(
+    session_name: str,
+    tunnel_mode: str,
+    ssh_port: int,
+    api_key: str,
+    enable_mtp: str,
+    update_pi: bool,
+):
+    pid_path, _ = get_daemon_paths(session_name)
+    pid_path.write_text(f"{os.getpid()}\n")
+
+    stop_event = threading.Event()
+    child_lock = threading.Lock()
+    children: dict[str, subprocess.Popen | None] = {"exec": None, "ssh": None}
+
+    def terminate_children():
+        with child_lock:
+            for key, proc in list(children.items()):
+                if proc and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                children[key] = None
+
+    def handle_signal(signum, frame):
+        stop_event.set()
+        terminate_children()
+        pid_path.unlink(missing_ok=True)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    log(f"[daemon] Started keep-alive & auto-heal daemon (PID {os.getpid()}) for session '{session_name}' (mode={tunnel_mode}).")
+
+    def ssh_forward_worker():
+        identity = ensure_colab_ssh_identity()
+        colab_bin = shutil.which("colab") or "colab"
+        proxy_cmd = (
+            f"{shlex.quote(colab_bin)} ssh --proxy-mode "
+            f"-s {shlex.quote(session_name)} -i {shlex.quote(str(identity))}"
+        )
+        while not stop_event.is_set():
+            # Refresh token before connecting SSH WebSocket. Only connect when the session is
+            # confirmed active: `colab ssh --proxy-mode -s NAME` auto-creates a missing session.
+            state = check_colab_session_state(session_name)
+            if state == "absent":
+                break
+            if state != "active":
+                stop_event.wait(5.0)
+                continue
+            ssh_cmd = [
+                "ssh",
+                "-N",
+                "-L", f"127.0.0.1:{ssh_port}:127.0.0.1:30000",
+                "-o", "ExitOnForwardFailure=yes",
+                "-o", "ServerAliveInterval=20",
+                "-o", "ServerAliveCountMax=3",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR",
+                "-o", f"ProxyCommand={proxy_cmd}",
+                "-i", str(identity),
+                "root@colab-runtime",
+            ]
+            log(f"[daemon] Connecting Colab SSH port-forward 127.0.0.1:{ssh_port} -> VM:30000...")
+            proc = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            with child_lock:
+                children["ssh"] = proc
+            for line in proc.stdout:
+                if line.strip():
+                    log(f"  [ssh] {line.strip()}")
+            proc.wait()
+            if stop_event.is_set():
+                break
+            log(f"[daemon] SSH tunnel disconnected (rc={proc.returncode}); reconnecting in 3s...")
+            stop_event.wait(3.0)
+
+    if tunnel_mode == "ssh":
+        threading.Thread(target=ssh_forward_worker, daemon=True).start()
+
+    # Run 15-minute (900s) kernel watchdog slices and refresh the 1h Colab runtimeProxyInfo
+    # token via `colab sessions` between slices so neither the kernel nor token ever expires.
+    absent_streak = 0
+    enable_tunnel_flag = "0" if tunnel_mode == "ssh" else "1"
+    try:
+        while not stop_event.is_set():
+            state = check_colab_session_state(session_name)
+            if state == "absent":
+                absent_streak += 1
+                if absent_streak >= 2:
+                    log(f"[daemon] Session '{session_name}' is no longer active on Colab. Exiting daemon.")
+                    break
+                stop_event.wait(5.0)
+                continue
+            absent_streak = 0
+
+            cmd = [
+                "colab", "exec", "-s", session_name,
+                "--timeout", "1200",
+                "--env", "WATCHDOG_ONLY=1",
+                "--env", "COLAB_KEEPALIVE_SECONDS=900",
+                "--env", f"COLAB_SGLANG_API_KEY={api_key}",
+                "--env", f"ENABLE_MTP={enable_mtp}",
+                "--env", f"ENABLE_TUNNEL={enable_tunnel_flag}",
+                "-f", os.path.abspath(__file__),
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            with child_lock:
+                children["exec"] = proc
+
+            for line in proc.stdout:
+                text = line.rstrip("\n")
+                if text:
+                    print(text, flush=True)
+                if text.startswith("TUNNEL_BASE_URL=") and update_pi and tunnel_mode == "cf":
+                    new_base_url = text.split("=", 1)[1].strip()
+                    try:
+                        update_pi_models_json(new_base_url, api_key)
+                        log(f"[daemon] Auto-updated ~/.pi/agent/models.json -> {new_base_url}")
+                    except Exception as e:
+                        log(f"[daemon] Failed to update models.json: {e}")
+
+            proc.wait()
+            if stop_event.is_set():
+                break
+            stop_event.wait(2.0)
+    finally:
+        stop_event.set()
+        terminate_children()
+        # Run `colab sessions` once more to prune any stale local state written by `colab exec` exit
+        try:
+            subprocess.run(["colab", "sessions"], capture_output=True, timeout=15)
+        except Exception:
+            pass
+        pid_path.unlink(missing_ok=True)
+
+
+def spawn_background_keepalive_daemon(
+    session_name: str,
+    tunnel_mode: str,
+    ssh_port: int,
+    api_key: str,
+    enable_mtp: str,
+    update_pi: bool,
+) -> tuple[int, Path]:
+    stop_local_keepalive_daemon(session_name, quiet=True)
+    _, log_path = get_daemon_paths(session_name)
+
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--keepalive-daemon",
+        "--session", session_name,
+        "--tunnel-mode", tunnel_mode,
+        "--ssh-port", str(ssh_port),
+        "--api-key", api_key,
+        "--enable-mtp", enable_mtp,
+    ]
+    if update_pi:
+        cmd.append("--update-pi")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=open(log_path, "a"),
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+    return proc.pid, log_path
+
+
+# ============================================================================
+# Local Interactive Wizard & Helper CLI (when invoked locally)
 # ============================================================================
 
 def prompt_choice(prompt_text: str, default: str) -> str:
@@ -460,7 +875,7 @@ def update_pi_models_json(base_url: str, api_key: str):
         ],
     }
     pi_models_path.write_text(json.dumps(data, indent=2) + "\n")
-    print(f"✓ Updated {pi_models_path} (provider: colab-g4)")
+    print(f"✓ Updated {pi_models_path} (provider: colab-g4 -> {base_url})")
 
 
 def run_local_interactive_wizard():
@@ -486,8 +901,21 @@ def run_local_interactive_wizard():
     mtp_choice = prompt_choice("   Select mode (1 or 2)", "1")
     enable_mtp = "0" if mtp_choice == "2" else "1"
 
+    print("\n4. Endpoint tunnel & keep-alive strategy:")
+    print("   [1] Cloudflare Quick Tunnel + Background Keep-Alive (https://*.trycloudflare.com/v1)")
+    print("   [2] Local SSH Port-Forward + Background Keep-Alive (http://127.0.0.1:30000/v1 via Colab SSH, lower latency)")
+    tunnel_choice = prompt_choice("   Select tunnel mode (1 or 2)", "1")
+    tunnel_mode = "ssh" if tunnel_choice == "2" else "cf"
+    ssh_port = 30000
+    if tunnel_mode == "ssh" and is_local_port_open(ssh_port):
+        ssh_port_str = prompt_choice("   Local port 30000 is in use; choose local forward port", "30001")
+        ssh_port = int(ssh_port_str)
+
     default_key = os.environ.get("COLAB_SGLANG_API_KEY", f"sk-qwen38-{secrets.token_hex(8)}")
-    api_key = prompt_choice("\n4. SGLang API Key (for Cloudflare Tunnel protection)", default_key)
+    api_key = prompt_choice("\n5. SGLang API Key", default_key)
+
+    # Stop any previous local keep-alive daemon before touching the remote kernel
+    was_daemon_running = stop_local_keepalive_daemon(session_name)
 
     sess_out = subprocess.getoutput("colab sessions")
     if f"[{session_name}]" not in sess_out:
@@ -495,6 +923,9 @@ def run_local_interactive_wizard():
         subprocess.run(["colab", "new", "-s", session_name, "--gpu", "G4"], check=True)
     else:
         print(f"\n-> Reusing existing Colab G4 session '{session_name}'.")
+        if was_daemon_running:
+            # Clear the running watchdog cell in ipykernel (does not affect nohup sglang/cloudflared)
+            subprocess.run(["colab", "restart-kernel", "-s", session_name], capture_output=True)
 
     weight_source = "hf"
     backup_to_drive = "0"
@@ -511,9 +942,12 @@ def run_local_interactive_wizard():
     print(f"\n-> Executing deployment on remote Colab G4 VM '{session_name}'...")
     cmd = [
         "colab", "exec", "-s", session_name,
-        "--timeout", "1800",
+        "--timeout", "3600",
+        "--env", "WATCHDOG_ONLY=0",
+        "--env", "COLAB_KEEPALIVE_SECONDS=0",
         "--env", f"COLAB_SGLANG_API_KEY={api_key}",
         "--env", f"ENABLE_MTP={enable_mtp}",
+        "--env", f"ENABLE_TUNNEL={'0' if tunnel_mode == 'ssh' else '1'}",
         "--env", f"WEIGHT_SOURCE={weight_source}",
         "--env", f"BACKUP_TO_DRIVE={backup_to_drive}",
         "-f", os.path.abspath(__file__),
@@ -531,16 +965,113 @@ def run_local_interactive_wizard():
     if proc.returncode != 0:
         sys.exit(proc.returncode)
 
-    if tunnel_base_url:
-        pi_choice = prompt_choice("\n5. Update ~/.pi/agent/models.json with this endpoint? (y/n)", "y")
-        if pi_choice.lower().startswith("y"):
-            update_pi_models_json(tunnel_base_url, api_key)
-            print("\nTest with pi:")
-            print(f'  pi --model "colab-g4/{MODEL_ID}" -p "看一下本机配置"')
+    if tunnel_mode == "ssh":
+        tunnel_base_url = f"http://127.0.0.1:{ssh_port}/v1"
+
+    pi_choice = prompt_choice("\n6. Update ~/.pi/agent/models.json with this endpoint? (y/n)", "y")
+    should_update_pi = pi_choice.lower().startswith("y")
+    if should_update_pi and tunnel_base_url:
+        update_pi_models_json(tunnel_base_url, api_key)
+
+    pid, log_path = spawn_background_keepalive_daemon(
+        session_name=session_name,
+        tunnel_mode=tunnel_mode,
+        ssh_port=ssh_port,
+        api_key=api_key,
+        enable_mtp=enable_mtp,
+        update_pi=should_update_pi,
+    )
+
+    if tunnel_mode == "ssh":
+        print(f"\n-> Waiting for Colab SSH local port-forward (127.0.0.1:{ssh_port})...")
+        for _ in range(25):
+            if check_sglang_healthy(api_key=api_key, port=ssh_port):
+                print(f"✓ SSH Tunnel ready at {tunnel_base_url}")
+                break
+            time.sleep(1)
+
+    print(f"✓ Background keep-alive & auto-heal daemon active (PID {pid})")
+    print(f"  Log: {log_path}")
+    print(f"  To stop instance & billing when done: python3 {os.path.basename(__file__)} --stop -s {session_name}")
+    if should_update_pi:
+        print("\nTest with pi:")
+        print(f'  pi --model "colab-g4/{MODEL_ID}" -p "看一下本机配置"')
+
+
+def handle_local_cli():
+    parser = argparse.ArgumentParser(description="Colab G4 SGLang Deployment & Keep-Alive Manager")
+    parser.add_argument("-s", "--session", default="qwen38-g4", help="Colab session name (default: qwen38-g4)")
+    parser.add_argument("-y", "--yes", action="store_true", help="Accept default wizard choices non-interactively")
+    parser.add_argument("--keepalive", action="store_true", help="Start/reattach background keep-alive daemon for an existing session")
+    parser.add_argument("--status", action="store_true", help="Show Colab session and local keep-alive daemon status")
+    parser.add_argument("--stop", action="store_true", help="Stop local keep-alive daemon and terminate Colab VM")
+    parser.add_argument("--tunnel-mode", choices=["cf", "ssh"], default="cf", help="Tunnel mode for --keepalive")
+    parser.add_argument("--ssh-port", type=int, default=30000, help="Local port for --tunnel-mode ssh")
+    parser.add_argument("--api-key", default=None, help="SGLang API key")
+    parser.add_argument("--enable-mtp", default="1", help="MTP setting (1 or 0)")
+    parser.add_argument("--update-pi", action="store_true", help="Auto-update ~/.pi/agent/models.json if tunnel URL changes")
+    parser.add_argument("--keepalive-daemon", action="store_true", help=argparse.SUPPRESS)
+
+    args = parser.parse_args()
+
+    # Load existing API key from ~/.pi/agent/models.json if not explicitly supplied
+    resolved_api_key = args.api_key or API_KEY
+    pi_models_path = Path.home() / ".pi" / "agent" / "models.json"
+    if not args.api_key and pi_models_path.exists():
+        try:
+            pi_cfg = json.loads(pi_models_path.read_text())
+            resolved_api_key = pi_cfg.get("providers", {}).get("colab-g4", {}).get("apiKey") or resolved_api_key
+        except Exception:
+            pass
+
+    if args.keepalive_daemon:
+        run_local_keepalive_daemon(
+            session_name=args.session,
+            tunnel_mode=args.tunnel_mode,
+            ssh_port=args.ssh_port,
+            api_key=resolved_api_key,
+            enable_mtp=args.enable_mtp,
+            update_pi=args.update_pi,
+        )
+        return
+
+    if args.stop:
+        stop_local_keepalive_daemon(args.session)
+        subprocess.run(["colab", "stop", "-s", args.session])
+        return
+
+    if args.status:
+        pid_path, log_path = get_daemon_paths(args.session)
+        if pid_path.exists():
+            pid = int(pid_path.read_text().strip())
+            alive = is_pid_alive(pid)
+            print(f"[keepalive] Daemon PID {pid}: {'RUNNING' if alive else 'DEAD'} (log: {log_path})")
+        else:
+            print(f"[keepalive] No local daemon running for '{args.session}'.")
+        subprocess.run(["colab", "status", "-s", args.session])
+        return
+
+    if args.keepalive:
+        if check_colab_session_state(args.session) != "active":
+            print(f"Error: Colab session '{args.session}' is not active. Run `python3 run_qwen38_g4.py` to create one.")
+            sys.exit(1)
+        pid, log_path = spawn_background_keepalive_daemon(
+            session_name=args.session,
+            tunnel_mode=args.tunnel_mode,
+            ssh_port=args.ssh_port,
+            api_key=resolved_api_key,
+            enable_mtp=args.enable_mtp,
+            update_pi=True,
+        )
+        print(f"✓ Attached background keep-alive daemon (PID {pid}) to session '{args.session}'")
+        print(f"  Log: {log_path}")
+        return
+
+    run_local_interactive_wizard()
 
 
 if __name__ == "__main__":
     if is_running_on_colab_vm():
         run_remote_vm_main()
     else:
-        run_local_interactive_wizard()
+        handle_local_cli()
