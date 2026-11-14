@@ -542,6 +542,26 @@ def get_daemon_paths(session_name: str) -> tuple[Path, Path]:
     )
 
 
+def get_deploy_config_path(session_name: str) -> Path:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", session_name)
+    return CACHE_DIR / f"deploy-{safe_name}.json"
+
+
+def save_deploy_config(session_name: str, tunnel_mode: str, ssh_port: int, enable_mtp: str):
+    """Remember how a session was deployed so `--keepalive` restarts SGLang with matching flags."""
+    get_deploy_config_path(session_name).write_text(json.dumps(
+        {"tunnel_mode": tunnel_mode, "ssh_port": ssh_port, "enable_mtp": enable_mtp}, indent=2
+    ) + "\n")
+
+
+def load_deploy_config(session_name: str) -> dict:
+    try:
+        return json.loads(get_deploy_config_path(session_name).read_text())
+    except Exception:
+        return {}
+
+
 def is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -799,14 +819,15 @@ def spawn_background_keepalive_daemon(
         "--session", session_name,
         "--tunnel-mode", tunnel_mode,
         "--ssh-port", str(ssh_port),
-        "--api-key", api_key,
         "--enable-mtp", enable_mtp,
     ]
     if update_pi:
         cmd.append("--update-pi")
 
+    # Pass the API key via environment rather than argv so it is not visible in `ps`
     proc = subprocess.Popen(
         cmd,
+        env={**os.environ, "COLAB_SGLANG_API_KEY": api_key},
         stdout=open(log_path, "a"),
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
@@ -973,6 +994,7 @@ def run_local_interactive_wizard():
     if should_update_pi and tunnel_base_url:
         update_pi_models_json(tunnel_base_url, api_key)
 
+    save_deploy_config(session_name, tunnel_mode, ssh_port, enable_mtp)
     pid, log_path = spawn_background_keepalive_daemon(
         session_name=session_name,
         tunnel_mode=tunnel_mode,
@@ -1005,14 +1027,23 @@ def handle_local_cli():
     parser.add_argument("--keepalive", action="store_true", help="Start/reattach background keep-alive daemon for an existing session")
     parser.add_argument("--status", action="store_true", help="Show Colab session and local keep-alive daemon status")
     parser.add_argument("--stop", action="store_true", help="Stop local keep-alive daemon and terminate Colab VM")
-    parser.add_argument("--tunnel-mode", choices=["cf", "ssh"], default="cf", help="Tunnel mode for --keepalive")
-    parser.add_argument("--ssh-port", type=int, default=30000, help="Local port for --tunnel-mode ssh")
+    parser.add_argument("--tunnel-mode", choices=["cf", "ssh"], default=None, help="Tunnel mode for --keepalive (default: as last deployed, else cf)")
+    parser.add_argument("--ssh-port", type=int, default=None, help="Local port for --tunnel-mode ssh (default: as last deployed, else 30000)")
     parser.add_argument("--api-key", default=None, help="SGLang API key")
-    parser.add_argument("--enable-mtp", default="1", help="MTP setting (1 or 0)")
+    parser.add_argument("--enable-mtp", choices=["0", "1"], default=None, help="MTP setting (default: as last deployed, else 1)")
     parser.add_argument("--update-pi", action="store_true", help="Auto-update ~/.pi/agent/models.json if tunnel URL changes")
     parser.add_argument("--keepalive-daemon", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+
+    # Fall back to the settings the wizard last deployed this session with
+    deploy_cfg = load_deploy_config(args.session)
+    if args.tunnel_mode is None:
+        args.tunnel_mode = deploy_cfg.get("tunnel_mode", "cf")
+    if args.ssh_port is None:
+        args.ssh_port = int(deploy_cfg.get("ssh_port", 30000))
+    if args.enable_mtp is None:
+        args.enable_mtp = str(deploy_cfg.get("enable_mtp", "1"))
 
     # Load existing API key from ~/.pi/agent/models.json if not explicitly supplied
     resolved_api_key = args.api_key or API_KEY
@@ -1029,7 +1060,7 @@ def handle_local_cli():
             session_name=args.session,
             tunnel_mode=args.tunnel_mode,
             ssh_port=args.ssh_port,
-            api_key=resolved_api_key,
+            api_key=args.api_key or os.environ.get("COLAB_SGLANG_API_KEY") or resolved_api_key,
             enable_mtp=args.enable_mtp,
             update_pi=args.update_pi,
         )
